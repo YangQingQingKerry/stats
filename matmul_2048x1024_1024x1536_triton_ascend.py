@@ -12,10 +12,10 @@ NUM_CORES_910B2 = 24
     configs=[
         # Preferred baseline: fully utilizes L0C (128x256 fp32 = 128KB),
         # while keeping L0A/L0B within 64KB limits with BLOCK_K=128.
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 4}, num_stages=2),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 3}, num_stages=2),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 256, "GROUP_M": 6}, num_stages=2),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 8}, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 4}),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 3}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 256, "GROUP_M": 6}),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 8}),
     ],
     key=["M", "N", "K"],
 )
