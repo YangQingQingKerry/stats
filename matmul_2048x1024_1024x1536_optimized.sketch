@@ -1,0 +1,86 @@
+# Optimized UnifiedSketch for Ascend 910B2
+# Target: (2048, 1024) x (1024, 1536)
+# Key ideas:
+# 1) static shape specialization (remove threshold/fallback branches)
+# 2) fixed 24-core launch, each core handles strided block ids
+# 3) lightweight 2D swizzle mapping (GROUP_SIZE=4) for better locality
+# 4) macro N=256 split into two N=128 inner tiles to reuse A tile per K-step
+# 5) FP32 accumulation + pipelined K-loop
+
+sketch matmul_2048x1024_1024x1536_opt {
+  tensors: A[2048, 1024]: f16; B[1024, 1536]: f16; C[2048, 1536]: f16;
+  constexpr: NUM_CORES=24;
+  constexpr: BLOCK_M=128, BLOCK_N_MACRO=256, BLOCK_N_INNER=128, BLOCK_K=256;
+  constexpr: GROUP_SIZE=4;
+  constexpr: NUM_BLOCKS_M=16, NUM_BLOCKS_N=6, NUM_BLOCKS=96;  # 16*6, exactly divisible by 24
+
+  @llm_hint("parallel", "coreidx")
+  for core_id in range(NUM_CORES):
+    # Each core handles 4 macro blocks: block_id = core_id + t*24
+    for block_id in range(core_id, NUM_BLOCKS, NUM_CORES):
+      raw_m = block_id // NUM_BLOCKS_N
+      raw_n = block_id % NUM_BLOCKS_N
+
+      # M >= N -> M-major swizzle to improve A reuse in cache hierarchy
+      task_m, task_n = swizzle2d(raw_m, raw_n, NUM_BLOCKS_M, NUM_BLOCKS_N, GROUP_SIZE, direction="m_major")
+
+      m_start = task_m * BLOCK_M
+      n_start = task_n * BLOCK_N_MACRO
+
+      # Split macro-N tile into two inner N=128 accumulators
+      c_acc_0 = alloc([BLOCK_M, BLOCK_N_INNER], llm_hint=["fastest", "accumulator", "init_zero"])
+      c_acc_1 = alloc([BLOCK_M, BLOCK_N_INNER], llm_hint=["fastest", "accumulator", "init_zero"])
+
+      # Ping-pong buffers for K pipeline (compiler can overlap MTE and CUBE)
+      a_buf_0  = alloc([BLOCK_M, BLOCK_K], llm_hint=["fast", "input_cache"])
+      a_buf_1  = alloc([BLOCK_M, BLOCK_K], llm_hint=["fast", "input_cache"])
+      b0_buf_0 = alloc([BLOCK_K, BLOCK_N_INNER], llm_hint=["fast", "input_cache"])
+      b0_buf_1 = alloc([BLOCK_K, BLOCK_N_INNER], llm_hint=["fast", "input_cache"])
+      b1_buf_0 = alloc([BLOCK_K, BLOCK_N_INNER], llm_hint=["fast", "input_cache"])
+      b1_buf_1 = alloc([BLOCK_K, BLOCK_N_INNER], llm_hint=["fast", "input_cache"])
+
+      # Prefetch k=0 tile
+      load(A[m_start:m_start+BLOCK_M, 0:BLOCK_K] -> a_buf_0)
+      load(B[0:BLOCK_K, n_start:n_start+BLOCK_N_INNER] -> b0_buf_0)
+      load(B[0:BLOCK_K, n_start+BLOCK_N_INNER:n_start+BLOCK_N_MACRO] -> b1_buf_0)
+
+      @llm_hint("pipeline")
+      for k_start in range(0, 1024, BLOCK_K):
+        phase = (k_start // BLOCK_K) % 2
+
+        if phase == 0:
+          a_cur  = a_buf_0
+          b0_cur = b0_buf_0
+          b1_cur = b1_buf_0
+          a_nxt  = a_buf_1
+          b0_nxt = b0_buf_1
+          b1_nxt = b1_buf_1
+        else:
+          a_cur  = a_buf_1
+          b0_cur = b0_buf_1
+          b1_cur = b1_buf_1
+          a_nxt  = a_buf_0
+          b0_nxt = b0_buf_0
+          b1_nxt = b1_buf_0
+
+        if k_start + BLOCK_K < 1024:
+          k_next = k_start + BLOCK_K
+          load(A[m_start:m_start+BLOCK_M, k_next:k_next+BLOCK_K] -> a_nxt)
+          load(B[k_next:k_next+BLOCK_K, n_start:n_start+BLOCK_N_INNER] -> b0_nxt)
+          load(B[k_next:k_next+BLOCK_K, n_start+BLOCK_N_INNER:n_start+BLOCK_N_MACRO] -> b1_nxt)
+
+        # Reuse one A tile for two N-inner GEMMs
+        gemm(a_cur, b0_cur, dst=c_acc_0)
+        gemm(a_cur, b1_cur, dst=c_acc_1)
+
+      # Write back two inner tiles
+      store(c_acc_0 -> C[m_start:m_start+BLOCK_M, n_start:n_start+BLOCK_N_INNER])
+      store(c_acc_1 -> C[m_start:m_start+BLOCK_M, n_start+BLOCK_N_INNER:n_start+BLOCK_N_MACRO])
+}
+
+@llm_hint("available_tiling")
+available_tiling:
+BLOCK_M=128, BLOCK_N_MACRO=256, BLOCK_N_INNER=128, BLOCK_K=256, GROUP_SIZE=4, NUM_CORES=24, SWIZZLE="m_major"   # recommended for this fixed shape
+BLOCK_M=128, BLOCK_N_MACRO=256, BLOCK_N_INNER=128, BLOCK_K=128, GROUP_SIZE=4, NUM_CORES=24, SWIZZLE="m_major"   # lower L0 pressure, more K steps
+BLOCK_M=256, BLOCK_N_MACRO=128, BLOCK_N_INNER=128, BLOCK_K=128, GROUP_SIZE=2, NUM_CORES=24, SWIZZLE="m_major"   # larger M tile, fewer M blocks
+BLOCK_M=128, BLOCK_N_MACRO=128, BLOCK_N_INNER=128, BLOCK_K=256, GROUP_SIZE=4, NUM_CORES=24, SWIZZLE="m_major"   # baseline-compatible fallback
