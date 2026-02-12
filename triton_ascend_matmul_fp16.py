@@ -9,19 +9,21 @@ K_SIZE = 1536
 
 # Ascend 910B4: 20 AI Core
 NUM_CORES = 20
-BLOCK_M = 128
-BLOCK_N = 256
-BLOCK_K = 256
 
 # Ascend 后端当前不调优 num_warps/num_stages 等参数，仅调 BLOCK_SIZE_*
 MATMUL_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64}),
     triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64}),
     triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128}),
+    triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 256}),
     triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128}),
 ]
 
 
+@triton.autotune(
+    configs=MATMUL_AUTOTUNE_CONFIGS,
+    key=["M", "N", "K"],
+)
 @triton.jit
 def matmul_kernel_fp16_ascend(
     a_ptr,
@@ -58,7 +60,6 @@ def matmul_kernel_fp16_ascend(
 
         m_idx = block_m * BLOCK_SIZE_M + offs_m
         n_idx = block_n * BLOCK_SIZE_N + offs_n
-
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -72,69 +73,6 @@ def matmul_kernel_fp16_ascend(
 
             a = tl.load(a_ptrs, mask=a_mask, other=0.0)
             b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-
-            accumulator += tl.dot(a, b)
-
-        c_ptrs = c_ptr + m_idx[:, None] * stride_cm + n_idx[None, :] * stride_cn
-        c_mask = (m_idx[:, None] < M) & (n_idx[None, :] < N)
-        tl.store(c_ptrs, accumulator.to(tl.float16), mask=c_mask)
-
-
-@triton.autotune(
-    configs=MATMUL_AUTOTUNE_CONFIGS,
-    key=["M", "N", "K"],
-)
-@triton.jit
-def matmul_kernel_fp16_ascend_autotune(
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    num_cores: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    # 固定核心数启动：pid 是核心索引
-    pid = tl.program_id(axis=0)
-    num_blocks_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_blocks_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_blocks = num_blocks_m * num_blocks_n
-
-    offs_m = tl.arange(0, BLOCK_SIZE_M)
-    offs_n = tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-    # 每个核心跨步处理多个 block
-    for block_idx in range(pid, num_blocks, num_cores):
-        block_m = block_idx // num_blocks_n
-        block_n = block_idx % num_blocks_n
-
-        m_idx = block_m * BLOCK_SIZE_M + offs_m
-        n_idx = block_n * BLOCK_SIZE_N + offs_n
-
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-        for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            k_idx = k_block * BLOCK_SIZE_K + offs_k
-
-            a_ptrs = a_ptr + m_idx[:, None] * stride_am + k_idx[None, :] * stride_ak
-            b_ptrs = b_ptr + k_idx[:, None] * stride_bk + n_idx[None, :] * stride_bn
-
-            a_mask = (m_idx[:, None] < M) & (k_idx[None, :] < K)
-            b_mask = (k_idx[:, None] < K) & (n_idx[None, :] < N)
-
-            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-
             accumulator += tl.dot(a, b)
 
         c_ptrs = c_ptr + m_idx[:, None] * stride_cm + n_idx[None, :] * stride_cn
@@ -156,34 +94,7 @@ def _validate_inputs(a: torch.Tensor, b: torch.Tensor) -> None:
         raise ValueError("a and b must be on the same device")
 
 
-def matmul_fp16_ascend(a: torch.Tensor, b: torch.Tensor, num_cores: int = NUM_CORES) -> torch.Tensor:
-    _validate_inputs(a, b)
-
-    c = torch.empty((M_SIZE, N_SIZE), device=a.device, dtype=torch.float16)
-
-    # 关键：grid 固定为核心数，而不是总 block 数
-    matmul_kernel_fp16_ascend[(num_cores,)](
-        a,
-        b,
-        c,
-        M_SIZE,
-        N_SIZE,
-        K_SIZE,
-        a.stride(0),
-        a.stride(1),
-        b.stride(0),
-        b.stride(1),
-        c.stride(0),
-        c.stride(1),
-        num_cores=num_cores,
-        BLOCK_SIZE_M=BLOCK_M,
-        BLOCK_SIZE_N=BLOCK_N,
-        BLOCK_SIZE_K=BLOCK_K,
-    )
-    return c
-
-
-def matmul_fp16_ascend_autotune(
+def matmul_fp16_ascend(
     a: torch.Tensor,
     b: torch.Tensor,
     num_cores: int = NUM_CORES,
@@ -194,7 +105,7 @@ def matmul_fp16_ascend_autotune(
     grid = lambda meta: (num_cores,)
 
     # 关键：调用时不传递 BLOCK_SIZE_*，由 autotune 自动选择
-    matmul_kernel_fp16_ascend_autotune[grid](
+    matmul_kernel_fp16_ascend[grid](
         a,
         b,
         c,
@@ -213,14 +124,11 @@ def matmul_fp16_ascend_autotune(
 
 
 class ModelNew(torch.nn.Module):
-    def __init__(self, num_cores: int = NUM_CORES, use_autotune: bool = True):
+    def __init__(self, num_cores: int = NUM_CORES):
         super().__init__()
         self.num_cores = num_cores
-        self.use_autotune = use_autotune
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        if self.use_autotune:
-            return matmul_fp16_ascend_autotune(a, b, num_cores=self.num_cores)
         return matmul_fp16_ascend(a, b, num_cores=self.num_cores)
 
 
@@ -237,7 +145,7 @@ if __name__ == "__main__":
     a = torch.randn((M_SIZE, K_SIZE), device=device, dtype=torch.float16)
     b = torch.randn((K_SIZE, N_SIZE), device=device, dtype=torch.float16)
 
-    model = ModelNew(num_cores=NUM_CORES, use_autotune=True)
+    model = ModelNew(num_cores=NUM_CORES)
     c = model(a, b)
 
     # 仅用于正确性检查
