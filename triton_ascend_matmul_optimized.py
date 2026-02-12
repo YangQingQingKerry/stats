@@ -224,8 +224,11 @@ class ModelNew(torch.nn.Module):
 
 def get_inputs():
     # Benchmark shape from task description.
-    x = torch.randn(2048, 1024, device="npu", dtype=torch.float16)
-    y = torch.randn(1024, 1536, device="npu", dtype=torch.float16)
+    use_npu = hasattr(torch, "npu") and torch.npu.is_available()
+    device = "npu" if use_npu else "cpu"
+    dtype = torch.float16 if use_npu else torch.float32
+    x = torch.randn(2048, 1024, device=device, dtype=dtype)
+    y = torch.randn(1024, 1536, device=device, dtype=dtype)
     return [x, y]
 
 
