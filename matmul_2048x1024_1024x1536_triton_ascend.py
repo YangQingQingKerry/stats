@@ -2,6 +2,11 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
+
 
 @triton.autotune(
     configs=[
@@ -124,6 +129,7 @@ def matmul_ascend_2048x1024_1024x1536_kernel(
 
 def matmul_ascend_optimized(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     assert x.ndim == 2 and y.ndim == 2, "x and y must be 2D tensors"
+    assert x.device.type == "npu" and y.device.type == "npu", "inputs must be on NPU device"
     m, k = x.shape
     k2, n = y.shape
     assert k == k2, f"matmul shape mismatch: {x.shape} @ {y.shape}"
