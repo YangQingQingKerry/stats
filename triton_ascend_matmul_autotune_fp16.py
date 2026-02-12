@@ -1,3 +1,6 @@
+import inspect
+import warnings
+
 import torch
 import triton
 import triton.language as tl
@@ -6,14 +9,52 @@ M_FIXED = 2048
 N_FIXED = 1024
 K_FIXED = 1536
 NUM_ASCEND_CORES = 20
+ASCEND_FORBIDDEN_TUNE_ARGS = (
+    "num_warps",
+    "num_ctas",
+    "num_stages",
+    "num_buffers_warp_spec",
+    "num_consumer_groups",
+    "reg_dec_producer",
+    "reg_inc_consumer",
+    "force_simt_template",
+    "enable_linearize",
+)
+
+
+# Some Ascend runtimes emit this as a Python warning; filter it as a safety net.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Please\s*DO\s*NOT\s*tune\s*args.*",
+)
+
+
+def _make_config(meta: dict) -> triton.Config:
+    """
+    Build Triton autotune config while pinning backend/runtime options
+    so only BLOCK_SIZE_* participate in tuning.
+    """
+    try:
+        params = inspect.signature(triton.Config).parameters
+    except (TypeError, ValueError):
+        params = {}
+
+    pinned = {}
+    for name in ASCEND_FORBIDDEN_TUNE_ARGS:
+        param = params.get(name)
+        if param is None or param.default is inspect._empty:
+            continue
+        pinned[name] = param.default
+
+    return triton.Config(meta, **pinned)
 
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64}),
-        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64}),
-        triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64}),
-        triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64}),
+        _make_config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64}),
+        _make_config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64}),
+        _make_config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64}),
+        _make_config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64}),
     ],
     key=["M", "N", "K"],
 )
