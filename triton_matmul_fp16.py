@@ -1,175 +1,206 @@
 """
-Triton Ascend MatMul FP16 Kernel (with Autotune)
-=================================================
+Triton Ascend MatMul FP16 Kernel — 高性能优化版
+================================================
 矩阵乘法: C = A @ B
 - M=2048, N=1024, K=1536
 - dtype: float16 (fp16)
-- 目标硬件: Ascend 910B (20 AI Cores)
+- 目标硬件: Ascend 910B
 
-使用固定核心数启动模式，每个核心循环处理多个输出块。
-通过 autotune 自动搜索最优的 BLOCK_M / BLOCK_N / BLOCK_K 组合。
+相比参考实现的优化点:
+1. 丰富的 autotune 配置空间 (16 组) — 参考实现仅 1 组
+2. GROUP_SIZE 同步纳入 autotune 搜索
+3. swizzle2d 提升 L2 cache 局部性
+4. tl.compile_hint("dot_pad_only_k") 指导 Ascend CUBE 单元对齐
+5. 3-arg tl.dot(a, b, acc) 融合乘累加，避免额外 += 开销
+6. K 循环内仅计算 K 相关偏移，M/N 偏移和掩码提升到循环外
+7. 动态获取 NPU 核心数，适配不同硬件型号
+8. forward 中保证输入 contiguous，避免非连续内存带来的性能损失
 """
 
+try:
+    from ai_kernel_generator.utils.triton_autotune_patch import apply_triton_patches
+    apply_triton_patches()
+except ImportError:
+    pass
+
 import torch
+import torch_npu
 import triton
 import triton.language as tl
+import triton.runtime.driver as driver
 
-# Ascend 910B 固定 20 个 AI Core
-NUM_CORES = 20
 
+def get_npu_properties():
+    """获取当前 NPU 设备属性（包括 AI Core 数量）"""
+    device = torch.npu.current_device()
+    return driver.active.utils.get_device_properties(device)
+
+
+# ---------------------------------------------------------------------------
+# Autotune 配置空间
+# ---------------------------------------------------------------------------
+# 参考实现仅有 1 组配置 (256,128,128,GROUP=4)。
+# 这里提供 16 组覆盖不同 BLOCK_M/N/K 和 GROUP_SIZE 的组合，
+# 让 autotune 在实际硬件上自动选出最优配置。
+#
+# 对 M=2048, N=1024, K=1536 的分析:
+#   BLOCK=128 → M 方向 16 块, N 方向 8 块 = 128 块 (负载均衡好)
+#   BLOCK=256 → M 方向 8 块,  N 方向 4 块 = 32 块  (单块计算量大)
+#   BLOCK_K 越大 → K 循环迭代次数越少，计算密度越高
+#   GROUP_SIZE 影响 swizzle2d 的分组粒度，决定 L2 cache 复用效率
+#
+# 注意：不要对 num_warps / num_stages / num_ctas 等调优，Ascend 后端不支持
+# ---------------------------------------------------------------------------
 
 @triton.autotune(
     configs=[
-        # 注意：不要对 num_warps / num_stages 等参数调优，Ascend 后端不支持
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 256}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 256}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 256}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 128}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 256}),
+        # --- 大块: 高计算密度，适合计算瓶颈场景 ---
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 256, "GROUP_SIZE": 4}),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE": 4}),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 256, "GROUP_SIZE": 2}),
+        # --- 中等块: 平衡计算密度和负载均衡 ---
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 256, "GROUP_SIZE": 4}),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 256, "GROUP_SIZE": 2}),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE": 4}),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE": 8}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 256, "GROUP_SIZE": 4}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 256, "GROUP_SIZE": 2}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE": 4}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE": 8}),
+        # --- 小块: 最优负载均衡，适合核心数较多或矩阵较小的场景 ---
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 256, "GROUP_SIZE": 4}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 256, "GROUP_SIZE": 2}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE": 4}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE": 8}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE": 2}),
     ],
-    key=['M', 'N', 'K'],  # 当 M, N, K 变化时触发重新 autotune
+    key=["M", "N", "K"],
 )
 @triton.jit
 def matmul_fp16_kernel(
-    a_ptr, b_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
+    mat_a, mat_b, mat_c,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
     num_cores: tl.constexpr,
-    BLOCK_M: tl.constexpr,   # 由 autotune configs 自动传入
-    BLOCK_N: tl.constexpr,   # 由 autotune configs 自动传入
-    BLOCK_K: tl.constexpr,   # 由 autotune configs 自动传入
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
 ):
     """
-    矩阵乘法内核: C[M, N] = A[M, K] @ B[K, N]
+    高性能矩阵乘法内核: C[M, N] = A[M, K] @ B[K, N]
 
-    使用固定核心数启动，每个核心通过循环处理多个输出块。
-    累加器使用 float32 以保证数值精度，最终转换回 float16 存储。
+    优化策略:
+    - 固定核心数启动 + 循环多块调度
+    - swizzle2d 改善 L2 cache 命中率
+    - compile_hint 指导 Ascend CUBE 单元 K 维度对齐
+    - 3-arg tl.dot 融合乘累加
+    - 循环不变量提升 (M/N 偏移和掩码在 K 循环外计算)
     """
-    # 1. 获取程序 ID（核心 ID: 0 ~ num_cores-1）
-    pid = tl.program_id(0)
+    pid = tl.program_id(axis=0)
 
-    # 计算输出矩阵的块数
+    # 计算输出矩阵的总块数
     NUM_BLOCKS_M = tl.cdiv(M, BLOCK_M)
     NUM_BLOCKS_N = tl.cdiv(N, BLOCK_N)
     NUM_BLOCKS = NUM_BLOCKS_M * NUM_BLOCKS_N
 
-    # 2. 每个核心循环处理多个块
+    # 每个核心循环处理多个输出块
     for block_idx in range(pid, NUM_BLOCKS, num_cores):
-        # 计算当前块的 2D 索引
-        block_m = block_idx // NUM_BLOCKS_N
-        block_n = block_idx % NUM_BLOCKS_N
+        # ------------------------------------------------------------------
+        # swizzle2d: 将线性 block_idx 映射为 2D (m, n) 索引
+        # 按 GROUP_SIZE 分组，使相邻核心处理空间上相近的块，
+        # 提升 A/B 在 L2 cache 中的复用率
+        # ------------------------------------------------------------------
+        raw_m = block_idx // NUM_BLOCKS_N
+        raw_n = block_idx % NUM_BLOCKS_N
+        task_m, task_n = tl.swizzle2d(
+            raw_m, raw_n,
+            NUM_BLOCKS_M, NUM_BLOCKS_N,
+            GROUP_SIZE,
+        )
 
-        # 当前块在 M 和 N 维度上的起始偏移
-        offs_m = block_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = block_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        # 当前块在 M/N 维度上的元素偏移 (K 循环不变量，提升到外层)
+        m_start = task_m * BLOCK_M
+        n_start = task_n * BLOCK_N
+        offs_m = m_start + tl.arange(0, BLOCK_M)
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        m_mask = offs_m < M
+        n_mask = offs_n < N
 
-        # 3. 初始化累加器（使用 float32 保证精度）
-        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        # 预计算 M/N 方向的基地址偏移 (K 循环内不再重复计算)
+        a_base = offs_m * K      # [BLOCK_M] — A 每行起始偏移
+        b_base = offs_n           # [BLOCK_N] — B 每列起始偏移
+        c_base = offs_m * N      # [BLOCK_M] — C 每行起始偏移
 
-        # 4. K 维度循环：逐块加载 A 和 B 并累加
-        for k in range(0, K, BLOCK_K):
-            offs_k = k + tl.arange(0, BLOCK_K)
+        # L0C 累加器 (float32 精度)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-            # 加载 A 块 [BLOCK_M, BLOCK_K]
-            a_offsets = offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-            a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-            a = tl.load(a_ptr + a_offsets, mask=a_mask, other=0.0)
+        # ------------------------------------------------------------------
+        # K 维度循环: 分块加载 A 和 B，在 CUBE 单元上做矩阵乘累加
+        # ------------------------------------------------------------------
+        for k_start in range(0, K, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
 
-            # 加载 B 块 [BLOCK_K, BLOCK_N]
-            b_offsets = offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-            b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
-            b = tl.load(b_ptr + b_offsets, mask=b_mask, other=0.0)
+            # 加载 A 块 [BLOCK_M, BLOCK_K] 到 L0A
+            a_offset = a_base[:, None] + offs_k[None, :]
+            a_mask = m_mask[:, None] & k_mask[None, :]
+            a_tile = tl.load(mat_a + a_offset, mask=a_mask, other=0.0)
+            tl.compile_hint(a_tile, "dot_pad_only_k")
 
-            # 矩阵乘累加
-            accumulator += tl.dot(a, b)
+            # 加载 B 块 [BLOCK_K, BLOCK_N] 到 L0B
+            b_offset = (offs_k * N)[:, None] + b_base[None, :]
+            b_mask = k_mask[:, None] & n_mask[None, :]
+            b_tile = tl.load(mat_b + b_offset, mask=b_mask, other=0.0)
+            tl.compile_hint(b_tile, "dot_pad_only_k")
 
-        # 5. 将结果从 float32 转换为 float16 并存储
-        result = accumulator.to(tl.float16)
+            # CUBE 矩阵乘累加 (3-arg 形式: acc = dot(a, b) + acc)
+            acc = tl.dot(a_tile, b_tile, acc)
 
-        c_offsets = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        tl.store(c_ptr + c_offsets, result, mask=c_mask)
+        # ------------------------------------------------------------------
+        # 存储结果: float32 -> float16 转换后写回全局内存
+        # ------------------------------------------------------------------
+        c_offset = c_base[:, None] + offs_n[None, :]
+        c_mask = m_mask[:, None] & n_mask[None, :]
+        tl.store(mat_c + c_offset, acc.to(tl.float16), mask=c_mask)
 
 
 class ModelNew(torch.nn.Module):
-    """
-    使用 Triton 内核实现矩阵乘法的 PyTorch 模块。
-    C[M, N] = A[M, K] @ B[K, N], dtype=float16
-    """
-
     def __init__(self):
         super().__init__()
 
-    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, y):
         """
-        参数:
-            a: 输入矩阵 A, shape [M, K], dtype=float16
-            b: 输入矩阵 B, shape [K, N], dtype=float16
-
-        返回:
-            c: 输出矩阵 C, shape [M, N], dtype=float16
+        Args:
+            x: 输入矩阵 A, shape [M, K], dtype=float16
+            y: 输入矩阵 B, shape [K, N], dtype=float16
+        Returns:
+            mat_c: 输出矩阵 C, shape [M, N], dtype=float16
         """
-        M, K = a.shape
-        K2, N = b.shape
-        assert K == K2, f"矩阵维度不匹配: A 的列数 ({K}) != B 的行数 ({K2})"
+        # 保证输入连续，避免非连续内存的跨步访问性能损失
+        x = x.contiguous()
+        y = y.contiguous()
 
-        # 分配输出张量
-        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+        M, K = x.shape
+        K2, N = y.shape
+        assert K == K2, f"矩阵维度不匹配: {K} != {K2}"
 
-        # autotune 要求 grid 使用 lambda，meta 包含 configs 中的参数
-        # 固定核心数启动: grid 始终为 (NUM_CORES,)
-        grid = lambda meta: (NUM_CORES,)
+        # 分配输出张量 (连续内存)
+        mat_c = torch.empty((M, N), dtype=x.dtype, device=x.device)
 
-        # 调用内核时不要传递 autotune configs 中的参数
-        # （BLOCK_M, BLOCK_N, BLOCK_K 由 autotune 自动注入）
+        # 动态获取 NPU 核心数
+        num_cores = get_npu_properties()["num_aicore"]
+
+        # autotune 要求 grid 使用 lambda
+        # 固定核心数启动: grid = (num_cores,)
+        grid = lambda meta: (num_cores,)
+
+        # 调用内核 — BLOCK_M/N/K 和 GROUP_SIZE 由 autotune 自动注入
         matmul_fp16_kernel[grid](
-            a, b, c,
-            M, N, K,
-            a.stride(0), a.stride(1),
-            b.stride(0), b.stride(1),
-            c.stride(0), c.stride(1),
-            num_cores=NUM_CORES,
-            # 不要写: BLOCK_M=128  ← 错误！autotune 会自动传入
+            x, y, mat_c,
+            M, N, K, num_cores,
+            # 不传递 autotune configs 中的参数
         )
 
-        return c
-
-
-def main():
-    """
-    主函数：演示 M=2048, N=1024, K=1536 的 fp16 矩阵乘法
-    """
-    # 矩阵维度
-    M, N, K = 2048, 1024, 1536
-
-    # 创建 fp16 输入矩阵
-    device = "npu"  # Ascend NPU 设备
-    a = torch.randn((M, K), device=device, dtype=torch.float16)
-    b = torch.randn((K, N), device=device, dtype=torch.float16)
-
-    # 使用 Triton 内核计算
-    model = ModelNew()
-    c = model(a, b)
-
-    # 使用 PyTorch 原生矩阵乘法验证
-    c_ref = torch.matmul(a, b)
-
-    # 检查结果正确性（fp16 精度下使用较宽松的容差）
-    if torch.allclose(c, c_ref, atol=1e-1, rtol=1e-2):
-        print("结果验证通过!")
-    else:
-        max_diff = (c - c_ref).abs().max().item()
-        print(f"结果存在差异，最大绝对误差: {max_diff}")
-
-    print(f"输入 A: shape={a.shape}, dtype={a.dtype}")
-    print(f"输入 B: shape={b.shape}, dtype={b.dtype}")
-    print(f"输出 C: shape={c.shape}, dtype={c.dtype}")
-
-
-if __name__ == "__main__":
-    main()
+        return mat_c
