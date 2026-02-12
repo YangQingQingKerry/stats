@@ -7,42 +7,14 @@ try:
 except Exception:
     torch_npu = None
 
+# Static configuration to avoid backend autotune warnings/parsing noise.
+DEFAULT_BLOCK_M = 128
+DEFAULT_BLOCK_N_MACRO = 256
+DEFAULT_BLOCK_N_INNER = 128
+DEFAULT_BLOCK_K = 256
+DEFAULT_GROUP_SIZE = 4
 
-@triton.autotune(
-    configs=[
-        # Recommended: matches the optimized sketch.
-        triton.Config(
-            {
-                "BLOCK_M": 128,
-                "BLOCK_N_MACRO": 256,
-                "BLOCK_N_INNER": 128,
-                "BLOCK_K": 256,
-                "GROUP_SIZE": 4,
-            }
-        ),
-        # Lower L0 pressure on B path, more K-loop iterations.
-        triton.Config(
-            {
-                "BLOCK_M": 128,
-                "BLOCK_N_MACRO": 256,
-                "BLOCK_N_INNER": 128,
-                "BLOCK_K": 128,
-                "GROUP_SIZE": 4,
-            }
-        ),
-        # Baseline-compatible fallback.
-        triton.Config(
-            {
-                "BLOCK_M": 128,
-                "BLOCK_N_MACRO": 128,
-                "BLOCK_N_INNER": 128,
-                "BLOCK_K": 256,
-                "GROUP_SIZE": 4,
-            }
-        ),
-    ],
-    key=["M", "N", "K"],
-)
+
 @triton.jit
 def matmul_ascend_2048x1024_1024x1536_kernel(
     A,
@@ -163,6 +135,11 @@ def matmul_ascend_optimized(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         c.stride(0),
         c.stride(1),
         num_cores,
+        BLOCK_M=DEFAULT_BLOCK_M,
+        BLOCK_N_MACRO=DEFAULT_BLOCK_N_MACRO,
+        BLOCK_N_INNER=DEFAULT_BLOCK_N_INNER,
+        BLOCK_K=DEFAULT_BLOCK_K,
+        GROUP_SIZE=DEFAULT_GROUP_SIZE,
     )
     return c
 
