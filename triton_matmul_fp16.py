@@ -1,19 +1,37 @@
 """
-Triton Ascend MatMul FP16 Kernel
-================================
+Triton Ascend MatMul FP16 Kernel (with Autotune)
+=================================================
 矩阵乘法: C = A @ B
 - M=2048, N=1024, K=1536
 - dtype: float16 (fp16)
 - 目标硬件: Ascend 910B (20 AI Cores)
 
 使用固定核心数启动模式，每个核心循环处理多个输出块。
+通过 autotune 自动搜索最优的 BLOCK_M / BLOCK_N / BLOCK_K 组合。
 """
 
 import torch
 import triton
 import triton.language as tl
 
+# Ascend 910B 固定 20 个 AI Core
+NUM_CORES = 20
 
+
+@triton.autotune(
+    configs=[
+        # 注意：不要对 num_warps / num_stages 等参数调优，Ascend 后端不支持
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 256}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 256}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 256}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 256}),
+    ],
+    key=['M', 'N', 'K'],  # 当 M, N, K 变化时触发重新 autotune
+)
 @triton.jit
 def matmul_fp16_kernel(
     a_ptr, b_ptr, c_ptr,
@@ -22,9 +40,9 @@ def matmul_fp16_kernel(
     stride_bk, stride_bn,
     stride_cm, stride_cn,
     num_cores: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,   # 由 autotune configs 自动传入
+    BLOCK_N: tl.constexpr,   # 由 autotune configs 自动传入
+    BLOCK_K: tl.constexpr,   # 由 autotune configs 自动传入
 ):
     """
     矩阵乘法内核: C[M, N] = A[M, K] @ B[K, N]
@@ -103,25 +121,20 @@ class ModelNew(torch.nn.Module):
         # 分配输出张量
         c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-        # Ascend 910B 有 20 个 AI Core
-        num_cores = 20
+        # autotune 要求 grid 使用 lambda，meta 包含 configs 中的参数
+        # 固定核心数启动: grid 始终为 (NUM_CORES,)
+        grid = lambda meta: (NUM_CORES,)
 
-        # 块大小配置
-        BLOCK_M = 128
-        BLOCK_N = 128
-        BLOCK_K = 128
-
-        # 使用固定核心数启动内核
-        matmul_fp16_kernel[(num_cores,)](
+        # 调用内核时不要传递 autotune configs 中的参数
+        # （BLOCK_M, BLOCK_N, BLOCK_K 由 autotune 自动注入）
+        matmul_fp16_kernel[grid](
             a, b, c,
             M, N, K,
             a.stride(0), a.stride(1),
             b.stride(0), b.stride(1),
             c.stride(0), c.stride(1),
-            num_cores=num_cores,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
+            num_cores=NUM_CORES,
+            # 不要写: BLOCK_M=128  ← 错误！autotune 会自动传入
         )
 
         return c
