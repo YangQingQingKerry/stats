@@ -1,0 +1,57 @@
+sketch matmul_2048x1024_1024x1536_opt {
+  symbols: M, N, K;
+  tensors: A[M, K]: f16; B[K, N]: f16; C[M, N]: f16;
+  constexpr: NUM_CORES=24, BLOCK_M=128, BLOCK_N=256, BLOCK_K=128, GROUP_M=4, STAGES=2;
+
+  # Static-shape specialization for this task.
+  assert M == 2048 and K == 1024 and N == 1536;
+
+  NUM_BLOCKS_M = ceil(M, BLOCK_M);
+  NUM_BLOCKS_N = ceil(N, BLOCK_N);
+  NUM_BLOCKS = NUM_BLOCKS_M * NUM_BLOCKS_N;
+
+  @llm_hint("parallel", "coreidx")
+  for core_id in range(NUM_CORES):
+    for linear_block in range(core_id, NUM_BLOCKS, NUM_CORES):
+      block_m = linear_block // NUM_BLOCKS_N;
+      block_n = linear_block % NUM_BLOCKS_N;
+
+      # M>=N for this shape, so use row-major grouped swizzle to improve A-tile reuse.
+      task_m, task_n = swizzle2d(block_m, block_n, NUM_BLOCKS_M, NUM_BLOCKS_N, GROUP_M);
+      m_start = task_m * BLOCK_M;
+      n_start = task_n * BLOCK_N;
+
+      c_tile = alloc([BLOCK_M, BLOCK_N], llm_hint=["fastest", "accumulator", "init_zero"]);
+      a_stage0 = alloc([BLOCK_M, BLOCK_K], llm_hint=["fast", "input_cache"]);
+      a_stage1 = alloc([BLOCK_M, BLOCK_K], llm_hint=["fast", "input_cache"]);
+      b_stage0 = alloc([BLOCK_K, BLOCK_N], llm_hint=["fast", "input_cache"]);
+      b_stage1 = alloc([BLOCK_K, BLOCK_N], llm_hint=["fast", "input_cache"]);
+
+      # Two-stage pipeline: overlap GM->L1/L0搬运 and CUBE GEMM.
+      @llm_hint("pipeline")
+      for kk in range(0, ceil(K, BLOCK_K) + STAGES):
+        if kk < ceil(K, BLOCK_K):
+          k_load = kk * BLOCK_K;
+          if kk % 2 == 0:
+            load(A[m_start:m_start+BLOCK_M, k_load:k_load+BLOCK_K] -> a_stage0);
+            load(B[k_load:k_load+BLOCK_K, n_start:n_start+BLOCK_N] -> b_stage0);
+          else:
+            load(A[m_start:m_start+BLOCK_M, k_load:k_load+BLOCK_K] -> a_stage1);
+            load(B[k_load:k_load+BLOCK_K, n_start:n_start+BLOCK_N] -> b_stage1);
+
+        if kk > 0 and kk - 1 < ceil(K, BLOCK_K):
+          @llm_hint("unroll")
+          if (kk - 1) % 2 == 0:
+            gemm(a_stage0, b_stage0, dst=c_tile);
+          else:
+            gemm(a_stage1, b_stage1, dst=c_tile);
+
+      store(c_tile -> C[m_start:m_start+BLOCK_M, n_start:n_start+BLOCK_N]);
+}
+
+@llm_hint("available_tiling")
+available_tiling:
+BLOCK_M=128, BLOCK_N=256, BLOCK_K=128, GROUP_M=4, STAGES=2
+BLOCK_M=256, BLOCK_N=128, BLOCK_K=128, GROUP_M=3, STAGES=2
+BLOCK_M=128, BLOCK_N=128, BLOCK_K=256, GROUP_M=6, STAGES=2
+BLOCK_M=64,  BLOCK_N=256, BLOCK_K=128, GROUP_M=8, STAGES=3
