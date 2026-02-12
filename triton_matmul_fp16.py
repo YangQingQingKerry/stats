@@ -3,14 +3,25 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 256}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 256}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 256}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 256}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128}),
+    ],
+    key=['M', 'N', 'K'],  # 当M/N/K变化时触发重新autotune
+)
 @triton.jit
 def matmul_fp16_kernel(
     a_ptr, b_ptr, c_ptr,
     M, N, K,
     num_cores: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,   # 由autotune自动注入
+    BLOCK_N: tl.constexpr,   # 由autotune自动注入
+    BLOCK_K: tl.constexpr,   # 由autotune自动注入
 ):
     # 获取核心ID (0 ~ num_cores-1)
     pid = tl.program_id(0)
@@ -73,14 +84,15 @@ class ModelNew(torch.nn.Module):
 
         # Ascend 910B4 有20个AI Core
         num_cores = 20
-        BLOCK_M, BLOCK_N, BLOCK_K = 128, 256, 256
 
-        # 使用固定核心数启动
-        matmul_fp16_kernel[(num_cores,)](
+        # autotune要求grid使用lambda形式，固定核心数启动
+        grid = lambda meta: (num_cores,)
+
+        # 调用时不传BLOCK_M/BLOCK_N/BLOCK_K，由autotune自动注入最优配置
+        matmul_fp16_kernel[grid](
             a, b, c,
             M, N, K,
             num_cores,
-            BLOCK_M, BLOCK_N, BLOCK_K,
         )
         return c
 
