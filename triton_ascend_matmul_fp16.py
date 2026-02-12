@@ -1,23 +1,36 @@
+try:
+    from ai_kernel_generator.utils.triton_autotune_patch import apply_triton_patches
+
+    apply_triton_patches()
+except ImportError:
+    pass
+
 import torch
 import triton
 import triton.language as tl
-
+import triton.runtime.driver as driver
 
 M_SIZE = 2048
 N_SIZE = 1024
 K_SIZE = 1536
+DEFAULT_NUM_CORES = 20
 
-# Ascend 910B4: 20 AI Core
-NUM_CORES = 20
-
-# Ascend 后端当前不调优 num_warps/num_stages 等参数，仅调 BLOCK_SIZE_*
+# 仅调 BLOCK 大小和 swizzle 分组；不调 num_warps/num_stages 等 Ascend 不支持参数
 MATMUL_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64}),
-    triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64}),
-    triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128}),
-    triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 256}),
-    triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128}),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 256, "GROUP_SIZE": 8}),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 256, "GROUP_SIZE": 8}),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 256, "GROUP_SIZE": 8}),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE": 4}),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE": 4}),
 ]
+
+
+def get_npu_num_cores(default_cores: int = DEFAULT_NUM_CORES) -> int:
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        device = torch.npu.current_device()
+        props = driver.active.utils.get_device_properties(device)
+        return int(props.get("num_aicore", default_cores))
+    return default_cores
 
 
 @triton.autotune(
@@ -25,59 +38,58 @@ MATMUL_AUTOTUNE_CONFIGS = [
     key=["M", "N", "K"],
 )
 @triton.jit
-def matmul_kernel_fp16_ascend(
-    a_ptr,
-    b_ptr,
-    c_ptr,
+def matmul_kernel_fp16_ascend_fast(
+    mat_a,
+    mat_b,
+    mat_c,
     M,
     N,
     K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
     num_cores: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
 ):
-    # 固定核心数启动：pid 是核心索引
+    # 固定核心数启动：每个核心跨步处理多个任务块
     pid = tl.program_id(axis=0)
-    num_blocks_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_blocks_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_blocks_m = tl.cdiv(M, BLOCK_M)
+    num_blocks_n = tl.cdiv(N, BLOCK_N)
     num_blocks = num_blocks_m * num_blocks_n
 
-    offs_m = tl.arange(0, BLOCK_SIZE_M)
-    offs_n = tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # 每个核心跨步处理多个 block
     for block_idx in range(pid, num_blocks, num_cores):
-        block_m = block_idx // num_blocks_n
-        block_n = block_idx % num_blocks_n
+        # 使用 swizzle2d 优化任务映射，降低热点访存冲突
+        block_m, block_n = tl.swizzle2d(
+            block_idx // num_blocks_n,
+            block_idx % num_blocks_n,
+            num_blocks_m,
+            num_blocks_n,
+            GROUP_SIZE,
+        )
 
-        m_idx = block_m * BLOCK_SIZE_M + offs_m
-        n_idx = block_n * BLOCK_SIZE_N + offs_n
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        m_idx = block_m * BLOCK_M + offs_m
+        n_idx = block_n * BLOCK_N + offs_n
 
-        for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            k_idx = k_block * BLOCK_SIZE_K + offs_k
+        # 固定 shape 下 tile 全整除，走无 mask 快路径
+        a_ptrs = mat_a + (m_idx[:, None] * K + offs_k[None, :])
+        b_ptrs = mat_b + (offs_k[:, None] * N + n_idx[None, :])
 
-            a_ptrs = a_ptr + m_idx[:, None] * stride_am + k_idx[None, :] * stride_ak
-            b_ptrs = b_ptr + k_idx[:, None] * stride_bk + n_idx[None, :] * stride_bn
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for _ in range(0, K, BLOCK_K):
+            a_tile = tl.load(a_ptrs)
+            b_tile = tl.load(b_ptrs)
+            tl.compile_hint(a_tile, "dot_pad_only_k")
+            tl.compile_hint(b_tile, "dot_pad_only_k")
+            acc = tl.dot(a_tile, b_tile, acc)
+            a_ptrs += BLOCK_K
+            b_ptrs += BLOCK_K * N
 
-            a_mask = (m_idx[:, None] < M) & (k_idx[None, :] < K)
-            b_mask = (k_idx[:, None] < K) & (n_idx[None, :] < N)
-
-            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-            accumulator += tl.dot(a, b)
-
-        c_ptrs = c_ptr + m_idx[:, None] * stride_cm + n_idx[None, :] * stride_cn
-        c_mask = (m_idx[:, None] < M) & (n_idx[None, :] < N)
-        tl.store(c_ptrs, accumulator.to(tl.float16), mask=c_mask)
+        c_ptrs = mat_c + (m_idx[:, None] * N + n_idx[None, :])
+        tl.store(c_ptrs, acc.to(tl.float16))
 
 
 def _validate_inputs(a: torch.Tensor, b: torch.Tensor) -> None:
@@ -94,42 +106,44 @@ def _validate_inputs(a: torch.Tensor, b: torch.Tensor) -> None:
         raise ValueError("a and b must be on the same device")
 
 
-def matmul_fp16_ascend(
+def matmul_fp16_ascend_optimized(
     a: torch.Tensor,
     b: torch.Tensor,
-    num_cores: int = NUM_CORES,
+    num_cores: int | None = None,
 ) -> torch.Tensor:
     _validate_inputs(a, b)
+    # 连续内存在当前地址计算方式下开销最低
+    if not a.is_contiguous():
+        a = a.contiguous()
+    if not b.is_contiguous():
+        b = b.contiguous()
+
+    if num_cores is None:
+        num_cores = get_npu_num_cores()
 
     c = torch.empty((M_SIZE, N_SIZE), device=a.device, dtype=torch.float16)
     grid = lambda meta: (num_cores,)
 
-    # 关键：调用时不传递 BLOCK_SIZE_*，由 autotune 自动选择
-    matmul_kernel_fp16_ascend[grid](
+    # 关键：autotune 参数由 configs 自动传入
+    matmul_kernel_fp16_ascend_fast[grid](
         a,
         b,
         c,
         M_SIZE,
         N_SIZE,
         K_SIZE,
-        a.stride(0),
-        a.stride(1),
-        b.stride(0),
-        b.stride(1),
-        c.stride(0),
-        c.stride(1),
         num_cores=num_cores,
     )
     return c
 
 
 class ModelNew(torch.nn.Module):
-    def __init__(self, num_cores: int = NUM_CORES):
+    def __init__(self, num_cores: int | None = None):
         super().__init__()
-        self.num_cores = num_cores
+        self.num_cores = get_npu_num_cores() if num_cores is None else num_cores
 
-    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return matmul_fp16_ascend(a, b, num_cores=self.num_cores)
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return matmul_fp16_ascend_optimized(x, y, num_cores=self.num_cores)
 
 
 def _default_device() -> str:
@@ -145,10 +159,9 @@ if __name__ == "__main__":
     a = torch.randn((M_SIZE, K_SIZE), device=device, dtype=torch.float16)
     b = torch.randn((K_SIZE, N_SIZE), device=device, dtype=torch.float16)
 
-    model = ModelNew(num_cores=NUM_CORES)
+    model = ModelNew()
     c = model(a, b)
 
-    # 仅用于正确性检查
     ref = torch.matmul(a, b)
     max_abs_diff = (c - ref).abs().max().item()
     print(f"output shape: {tuple(c.shape)}, dtype: {c.dtype}, max_abs_diff={max_abs_diff:.6f}")
